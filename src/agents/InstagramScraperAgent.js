@@ -5,16 +5,16 @@ const { typeWithHumanDelay, randomScroll, randomClick } = require('../utils/Huma
 const { saveData } = require('../data/DataHandler');
 const { formatDate } = require('../utils/DateFormatter');
 const { promptUserIntervention } = require('../utils/UserIntervention');
-const { solveCaptcha } = require('../src/utils/CaptchaSolver');
+const { solveCaptcha } = require('../utils/CaptchaSolver');
 const { retryOperation } = require('../utils/RetryUtils');
 const { identifySelector } = require('../utils/OpenAIUtils');
-const config = require('../config/config');
+const randomUserAgent = require('random-useragent');
 
 puppeteer.use(StealthPlugin());
 
 async function login(page, username, password) {
     logEvent('Navigating to Instagram login page...');
-    await page.goto('https://www.instagram.com/accounts/login/');
+    await page.goto('https://www.instagram.com/accounts/login/', { waitUntil: 'networkidle2' });
     await page.waitForTimeout(1000 + Math.random() * 2000);
 
     logEvent('Identifying username input field...');
@@ -28,10 +28,9 @@ async function login(page, username, password) {
     await typeWithHumanDelay(page, usernameSelector, username);
     await typeWithHumanDelay(page, passwordSelector, password);
     await page.click(loginButtonSelector);
-    await page.waitForNavigation();
+    await page.waitForNavigation({ waitUntil: 'networkidle2' });
     await page.waitForTimeout(1000 + Math.random() * 2000);
 
-    // Check for captcha or human verification
     const captchaSolved = await solveCaptcha(page);
     if (!captchaSolved) {
         logEvent('Captcha not solved by AI/ML. Pausing for human intervention...');
@@ -40,8 +39,8 @@ async function login(page, username, password) {
 }
 
 async function scrapeProfile(page, targetProfile) {
-    logEvent('Navigating to target profile...');
-    await page.goto(`https://www.instagram.com/${targetProfile}/`);
+    logEvent(`Navigating to target profile: ${targetProfile}...`);
+    await page.goto(`https://www.instagram.com/${targetProfile}/`, { waitUntil: 'networkidle2' });
     await page.waitForTimeout(1000 + Math.random() * 2000);
 
     logEvent('Scraping profile information...');
@@ -62,47 +61,73 @@ async function scrapeProfile(page, targetProfile) {
     return profileData;
 }
 
+async function scrapePostDetails(postElement) {
+    try {
+        const postText = postElement.querySelector('img')?.alt || '';
+        const postDate = postElement.querySelector('time')?.getAttribute('datetime') || '';
+        const mediaURL = postElement.querySelector('img')?.src || '';
+        return { text: postText, date: postDate, media: mediaURL };
+    } catch (error) {
+        logEvent(`Error scraping post details: ${error.message}`, 'error');
+        return null;
+    }
+}
+
 async function scrapePosts(page, dateRange) {
     logEvent('Starting to scrape posts...');
     const postsData = [];
     let lastPostDate = new Date();
 
     while (lastPostDate >= new Date(dateRange.split(' to ')[0])) {
+        let previousHeight = await page.evaluate('document.body.scrollHeight');
         await randomScroll(page);
         await randomClick(page);
 
         const posts = await page.evaluate(() => {
             try {
                 const postElements = document.querySelectorAll('article > div > div > div > div > a');
-                const postArray = [];
-                postElements.forEach(post => {
-                    const postText = post.querySelector('img')?.alt || '';
-                    const postDate = post.querySelector('time')?.getAttribute('datetime') || '';
-                    const mediaURL = post.querySelector('img')?.src || '';
-                    postArray.push({ text: postText, date: postDate, media: mediaURL });
-                });
-                return postArray;
+                return Array.from(postElements).map(postElement => ({
+                    text: postElement.querySelector('img')?.alt || '',
+                    date: postElement.querySelector('time')?.getAttribute('datetime') || '',
+                    media: postElement.querySelector('img')?.src || ''
+                }));
             } catch (error) {
                 logEvent(`Error scraping posts: ${error.message}`, 'error');
                 return [];
             }
         });
 
-        postsData.push(...posts);
-        lastPostDate = new Date(posts[posts.length - 1].date);
+        postsData.push(...posts.filter(post => post.text && post.date)); // Enhanced data validation
+        if (posts.length > 0) {
+            lastPostDate = new Date(posts[posts.length - 1].date);
+        } else {
+            logEvent('No more posts found, stopping scraping.', 'info');
+            break;
+        }
+
+        let newHeight = await page.evaluate('document.body.scrollHeight');
+        if (newHeight === previousHeight) break; // No more posts to load
 
         logEvent('Scrolling to load more posts...');
-        await page.evaluate(() => window.scrollBy(0, window.innerHeight));
-        await page.waitForTimeout(2000 + Math.random() * 2000); // Randomized delay
+        await page.waitForTimeout(2000 + Math.random() * 2000);
     }
 
-    logEvent('Posts scraped successfully.');
+    logEvent(`Scraped a total of ${postsData.length} posts.`);
     return postsData;
 }
 
 async function scrapeInstagram(username, password, targetProfile, dateRange) {
-    const browser = await puppeteer.launch({ headless: false });
+    const proxyUrl = process.env.PROXY_URL || '';
+
+    const browser = await puppeteer.launch({
+        headless: false,
+        args: proxyUrl ? [`--proxy-server=${proxyUrl}`] : [],
+        defaultViewport: { width: 1280, height: 800 }
+    });
+
     const page = await browser.newPage();
+    const userAgent = randomUserAgent.getRandom();
+    await page.setUserAgent(userAgent);
 
     try {
         await retryOperation(async () => {
@@ -113,7 +138,6 @@ async function scrapeInstagram(username, password, targetProfile, dateRange) {
             logEvent('Scraping completed.');
             await browser.close();
 
-            // Save data in structured format
             const structuredData = {
                 profile: profileData,
                 posts: postsData.map(post => ({
@@ -126,7 +150,7 @@ async function scrapeInstagram(username, password, targetProfile, dateRange) {
 
             logEvent('Data saved successfully.');
             return structuredData;
-        }, 3, 5000); // Retry operation up to 3 times with a 5-second delay between attempts
+        }, 3, 5000);
     } catch (error) {
         logEvent(`Error: ${error.message}`, 'error');
         await browser.close();
