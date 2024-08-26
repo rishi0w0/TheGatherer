@@ -8,7 +8,6 @@ const { promptUserIntervention } = require('../utils/UserIntervention');
 const { solveCaptcha } = require('../utils/CaptchaSolver');
 const { retryOperation } = require('../utils/RetryUtils');
 const { identifySelector } = require('../utils/OpenAIUtils');
-const config = require('../config/config');
 const randomUserAgent = require('random-useragent');
 
 puppeteer.use(StealthPlugin());
@@ -31,7 +30,6 @@ async function login(page, username, password) {
     await page.click(loginButtonSelector);
     await page.waitForNavigation({ waitUntil: 'networkidle2' });
 
-    // Check for captcha or human verification
     const captchaSolved = await solveCaptcha(page);
     if (!captchaSolved) {
         logEvent('Captcha not solved by AI/ML. Pausing for human intervention...');
@@ -61,34 +59,46 @@ async function scrapeProfile(page, targetProfile) {
     return profileData;
 }
 
+async function scrapePostDetails(postElement) {
+    try {
+        const postText = postElement.innerText || '';
+        const postDate = postElement.closest('abbr')?.getAttribute('data-utime') || '';
+        const mediaElements = postElement.querySelectorAll('img, video');
+        const mediaURLs = Array.from(mediaElements).map(media => media.src || media.poster);
+        return { text: postText, date: postDate, media: mediaURLs };
+    } catch (error) {
+        logEvent(`Error scraping post details: ${error.message}`, 'error');
+        return null;
+    }
+}
+
 async function scrapePosts(page, dateRange) {
     logEvent('Starting to scrape posts...');
     const postsData = [];
     let lastPostDate = new Date();
 
     while (lastPostDate >= new Date(dateRange.split(' to ')[0])) {
+        let previousHeight = await page.evaluate('document.body.scrollHeight');
         await randomScroll(page);
         await randomClick(page);
 
         const posts = await page.evaluate(() => {
             try {
                 const postElements = document.querySelectorAll('div[data-ad-comet-preview="message"]');
-                const postArray = [];
-                postElements.forEach(post => {
-                    const postText = post.innerText;
-                    const postDate = post.closest('abbr')?.getAttribute('data-utime') || '';
-                    const mediaElements = post.querySelectorAll('img, video');
+                return Array.from(postElements).map(postElement => {
+                    const postText = postElement.innerText || '';
+                    const postDate = postElement.closest('abbr')?.getAttribute('data-utime') || '';
+                    const mediaElements = postElement.querySelectorAll('img, video');
                     const mediaURLs = Array.from(mediaElements).map(media => media.src || media.poster);
-                    postArray.push({ text: postText, date: postDate, media: mediaURLs });
+                    return { text: postText, date: postDate, media: mediaURLs };
                 });
-                return postArray;
             } catch (error) {
                 logEvent(`Error scraping posts: ${error.message}`, 'error');
                 return [];
             }
         });
 
-        postsData.push(...posts);
+        postsData.push(...posts.filter(post => post.text && post.date)); // Enhanced data validation
         if (posts.length > 0) {
             lastPostDate = new Date(posts[posts.length - 1].date);
         } else {
@@ -96,9 +106,11 @@ async function scrapePosts(page, dateRange) {
             break;
         }
 
+        let newHeight = await page.evaluate('document.body.scrollHeight');
+        if (newHeight === previousHeight) break; // No more posts to load
+
         logEvent('Scrolling to load more posts...');
-        await page.evaluate(() => window.scrollBy(0, window.innerHeight));
-        await page.waitForTimeout(2000 + Math.random() * 2000); // Randomized delay
+        await page.waitForTimeout(2000 + Math.random() * 2000);
     }
 
     logEvent(`Scraped a total of ${postsData.length} posts.`);
@@ -106,7 +118,7 @@ async function scrapePosts(page, dateRange) {
 }
 
 async function scrapeFacebook(username, password, targetProfile, dateRange) {
-    const proxyUrl = process.env.PROXY_URL || ''; // Proxy support
+    const proxyUrl = process.env.PROXY_URL || '';
 
     const browser = await puppeteer.launch({
         headless: false,
@@ -115,8 +127,7 @@ async function scrapeFacebook(username, password, targetProfile, dateRange) {
     });
 
     const page = await browser.newPage();
-
-    const userAgent = randomUserAgent.getRandom(); // User-Agent randomization
+    const userAgent = randomUserAgent.getRandom();
     await page.setUserAgent(userAgent);
 
     try {
@@ -128,7 +139,6 @@ async function scrapeFacebook(username, password, targetProfile, dateRange) {
             logEvent('Scraping completed.');
             await browser.close();
 
-            // Save data in structured format
             const structuredData = {
                 profile: profileData,
                 posts: postsData.map(post => ({
@@ -141,11 +151,10 @@ async function scrapeFacebook(username, password, targetProfile, dateRange) {
 
             logEvent('Data saved successfully.');
             return structuredData;
-        }, 3, 5000); // Retry operation up to 3 times with a 5-second delay between attempts
+        }, 3, 5000);
     } catch (error) {
         logEvent(`Error: ${error.message}`, 'error');
         await browser.close();
-        throw error; // Rethrow the error after logging and closing the browser
     }
 }
 
