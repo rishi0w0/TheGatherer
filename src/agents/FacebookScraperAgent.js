@@ -5,16 +5,17 @@ const { typeWithHumanDelay, randomScroll, randomClick } = require('../utils/Huma
 const { saveData } = require('../data/DataHandler');
 const { formatDate } = require('../utils/DateFormatter');
 const { promptUserIntervention } = require('../utils/UserIntervention');
-const { solveCaptcha } = require('../utils/CaptchaSolver.');
+const { solveCaptcha } = require('../utils/CaptchaSolver');
 const { retryOperation } = require('../utils/RetryUtils');
 const { identifySelector } = require('../utils/OpenAIUtils');
 const config = require('../config/config');
+const randomUserAgent = require('random-useragent');
 
 puppeteer.use(StealthPlugin());
 
 async function login(page, username, password) {
     logEvent('Navigating to Facebook login page...');
-    await page.goto('https://www.facebook.com/login/');
+    await page.goto('https://www.facebook.com/login/', { waitUntil: 'networkidle2' });
     await page.waitForTimeout(1000 + Math.random() * 2000);
 
     logEvent('Identifying username input field...');
@@ -28,8 +29,7 @@ async function login(page, username, password) {
     await typeWithHumanDelay(page, usernameSelector, username);
     await typeWithHumanDelay(page, passwordSelector, password);
     await page.click(loginButtonSelector);
-    await page.waitForNavigation();
-    await page.waitForTimeout(1000 + Math.random() * 2000);
+    await page.waitForNavigation({ waitUntil: 'networkidle2' });
 
     // Check for captcha or human verification
     const captchaSolved = await solveCaptcha(page);
@@ -40,8 +40,8 @@ async function login(page, username, password) {
 }
 
 async function scrapeProfile(page, targetProfile) {
-    logEvent('Navigating to target profile...');
-    await page.goto(`https://www.facebook.com/${targetProfile}`);
+    logEvent(`Navigating to target profile: ${targetProfile}...`);
+    await page.goto(`https://www.facebook.com/${targetProfile}`, { waitUntil: 'networkidle2' });
     await page.waitForTimeout(1000 + Math.random() * 2000);
 
     logEvent('Scraping profile information...');
@@ -89,20 +89,35 @@ async function scrapePosts(page, dateRange) {
         });
 
         postsData.push(...posts);
-        lastPostDate = new Date(posts[posts.length - 1].date);
+        if (posts.length > 0) {
+            lastPostDate = new Date(posts[posts.length - 1].date);
+        } else {
+            logEvent('No more posts found, stopping scraping.', 'info');
+            break;
+        }
 
         logEvent('Scrolling to load more posts...');
         await page.evaluate(() => window.scrollBy(0, window.innerHeight));
         await page.waitForTimeout(2000 + Math.random() * 2000); // Randomized delay
     }
 
-    logEvent('Posts scraped successfully.');
+    logEvent(`Scraped a total of ${postsData.length} posts.`);
     return postsData;
 }
 
 async function scrapeFacebook(username, password, targetProfile, dateRange) {
-    const browser = await puppeteer.launch({ headless: false });
+    const proxyUrl = process.env.PROXY_URL || ''; // Proxy support
+
+    const browser = await puppeteer.launch({
+        headless: false,
+        args: proxyUrl ? [`--proxy-server=${proxyUrl}`] : [],
+        defaultViewport: { width: 1280, height: 800 }
+    });
+
     const page = await browser.newPage();
+
+    const userAgent = randomUserAgent.getRandom(); // User-Agent randomization
+    await page.setUserAgent(userAgent);
 
     try {
         await retryOperation(async () => {
@@ -130,6 +145,8 @@ async function scrapeFacebook(username, password, targetProfile, dateRange) {
     } catch (error) {
         logEvent(`Error: ${error.message}`, 'error');
         await browser.close();
+        throw error; // Rethrow the error after logging and closing the browser
+    }
 }
+
 module.exports = { scrapeFacebook };
-}
